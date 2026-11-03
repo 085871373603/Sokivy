@@ -1,0 +1,2 @@
+# Sokivy
+Stock opname kivy
