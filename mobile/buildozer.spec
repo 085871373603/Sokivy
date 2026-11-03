@@ -14,7 +14,9 @@ presplash.filename = assets/st_icon.png
 # INTERNET is only used when the user explicitly connects to the Arinex API
 # or shares a report through WhatsApp. Offline data entry remains available.
 android.permissions = INTERNET
+android.api = 36
 android.minapi = 23
+android.accept_sdk_license = True
 android.archs = arm64-v8a
 android.allow_backup = False
 
