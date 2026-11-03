@@ -1,0 +1,1 @@
+# For desktop logic tests only. Android APK requirements are declared in buildozer.spec.

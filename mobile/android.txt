@@ -1,0 +1,3 @@
+title=ST Stock Opname
+author=Arinex Digital Solution
+orientation=portrait
