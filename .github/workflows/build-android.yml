@@ -1,24 +1,19 @@
 name: Build ST Stock Opname APK
 
 on:
-  workflow_dispatch:
   push:
     branches: [main, master]
-    paths:
-      - "mobile/**"
-      - "tests/**"
-      - ".github/workflows/build-android.yml"
-      - ".github/workflows/tests.yml"
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  build-apk:
-    name: Build Android APK (debug)
-    runs-on: ubuntu-22.04
-    timeout-minutes: 120
-
+  test:
+    name: Uji otomatis
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -26,139 +21,165 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
-          cache: pip
-          cache-dependency-path: mobile/requirements-dev.txt
+          python-version: '3.11'
 
-      - name: Run source checks before Android toolchain setup
-        run: |
-          python -m py_compile mobile/main.py mobile/repository.py mobile/api_repository.py
-          python -m unittest discover -s tests -v
+      - name: Periksa sintaks Python
+        run: python -m py_compile mobile/main.py mobile/repository.py mobile/api_repository.py
+
+      - name: Jalankan unit test
+        run: python -m unittest discover -s tests -v
+
+  build:
+    name: Bangun APK Android
+    needs: test
+    # Build APK hanya saat tombol Run workflow ditekan atau tag v* dibuat.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python untuk Buildozer
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
 
-      # This action installs Android command-line tools and accepts Google's
-      # SDK licenses non-interactively. Build Tools and API 36 are installed
-      # explicitly in the next step before Buildozer is allowed to run.
-      - name: Set up Android SDK and accept licenses
-        uses: android-actions/setup-android@v4
+      - name: Pasang dependensi sistem
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y git zip unzip autoconf libtool pkg-config zlib1g-dev \
+            libncurses5-dev libncursesw5-dev libtinfo6 cmake libffi-dev libssl-dev automake \
+            libltdl-dev
+
+      - name: Pulihkan cache SDK, NDK, dan hasil kompilasi
+        uses: actions/cache/restore@v4
         with:
-          accept-android-sdk-licenses: true
-          log-accepted-android-sdk-licenses: false
-          packages: platform-tools
+          path: |
+            ~/.buildozer
+            mobile/.buildozer
+          key: st-stock-p4a-2024.01.21-${{ runner.os }}-${{ hashFiles('mobile/buildozer.spec') }}-${{ github.run_id }}
+          restore-keys: |
+            st-stock-p4a-2024.01.21-${{ runner.os }}-${{ hashFiles('mobile/buildozer.spec') }}-
+            st-stock-p4a-2024.01.21-${{ runner.os }}-
 
-      - name: Install and verify required Android SDK packages
+      - name: Pasang Buildozer dan Cython yang kompatibel
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade buildozer "cython==0.29.34" setuptools virtualenv
+          buildozer --version
+          cython --version
+          java -version
+
+      - name: Verifikasi konfigurasi toolchain yang dikunci
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from configparser import ConfigParser
+          config = ConfigParser()
+          if not config.read('mobile/buildozer.spec'):
+              raise SystemExit('mobile/buildozer.spec tidak ditemukan')
+          checks = {
+              'requirements': 'python3,kivy==2.3.0',
+              'android.api': '33',
+              'android.minapi': '24',
+              'android.ndk': '25b',
+              'p4a.branch': 'v2024.01.21',
+          }
+          for key, expected in checks.items():
+              actual = config.get('app', key).replace(' ', '')
+              if actual != expected:
+                  raise SystemExit(f'{key}: diharapkan {expected!r}, ditemukan {actual!r}')
+              print(f'OK {key} = {actual}')
+          if not config.getboolean('app', 'android.accept_sdk_license'):
+              raise SystemExit('android.accept_sdk_license harus True')
+          print('OK android.accept_sdk_license = True')
+          PY
+
+      - name: Bangun APK debug
+        working-directory: mobile
         shell: bash
         run: |
           set -euo pipefail
+          buildozer -v android debug 2>&1 | tee ../build.log
 
-          SDKMANAGER="$(command -v sdkmanager)"
-          SDKMANAGER_REAL="$(readlink -f "$SDKMANAGER")"
-          CMDLINE_VERSION_DIR="$(dirname "$(dirname "$SDKMANAGER_REAL")")"
-          CMDLINE_TOOLS_DIR="$(dirname "$CMDLINE_VERSION_DIR")"
-          SDK_ROOT="$(dirname "$CMDLINE_TOOLS_DIR")"
-
-          echo "Android SDK root: $SDK_ROOT"
-          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
-
-          # setup-android has already accepted SDK licenses. Confirm that
-          # the license command is clean, then install the exact packages
-          # Buildozer needs so there is no interactive license prompt later.
-          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses
-          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
-            "platform-tools" \
-            "build-tools;37.0.0" \
-            "platforms;android-36"
-
-          # Buildozer currently looks for the legacy path tools/bin/sdkmanager.
-          # Map that path to the installed cmdline-tools version directory.
-          rm -rf "$SDK_ROOT/tools"
-          ln -s "$CMDLINE_VERSION_DIR" "$SDK_ROOT/tools"
-
-          # Make Buildozer use the already provisioned and licensed SDK.
-          BUILDOZER_SDK="$HOME/.buildozer/android/platform/android-sdk"
-          mkdir -p "$(dirname "$BUILDOZER_SDK")"
-          if [ -e "$BUILDOZER_SDK" ] || [ -L "$BUILDOZER_SDK" ]; then
-            rm -rf "$BUILDOZER_SDK"
-          fi
-          ln -s "$SDK_ROOT" "$BUILDOZER_SDK"
-
-          # Fail early with a clear message if SDK provisioning was incomplete.
-          test -x "$SDK_ROOT/tools/bin/sdkmanager"
-          test -x "$SDK_ROOT/platform-tools/adb"
-          test -x "$SDK_ROOT/build-tools/37.0.0/aidl"
-          test -d "$SDK_ROOT/platforms/android-36"
-          echo "Android SDK packages and Buildozer compatibility path verified."
-
-      - name: Install Linux build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential \
-            git zip unzip \
-            autoconf automake autopoint gettext libtool libltdl-dev \
-            pkg-config cmake \
-            zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 \
-            libffi-dev libssl-dev
-
-      - name: Install Buildozer
-        run: |
-          python -m pip install --upgrade pip wheel
-          python -m pip install "setuptools<81" "Cython==0.29.34" buildozer
-          buildozer --version
-          java -version
-
-      - name: Verify Buildozer SDK configuration
-        working-directory: mobile
-        run: |
-          python - <<'PY'
-          from configparser import ConfigParser
-          from pathlib import Path
-          import os
-
-          config = ConfigParser()
-          loaded = config.read("buildozer.spec")
-          assert loaded, "buildozer.spec tidak ditemukan"
-          assert config.getboolean("app", "android.accept_sdk_license"), \
-              "android.accept_sdk_license harus True"
-          assert config.get("app", "android.api") == "36", \
-              "android.api harus dipatok ke 36 agar sesuai SDK yang dipasang"
-          sdk = Path.home() / ".buildozer/android/platform/android-sdk"
-          assert sdk.is_dir(), f"SDK Buildozer tidak ditemukan: {sdk}"
-          assert (sdk / "tools/bin/sdkmanager").is_file(), "sdkmanager tidak ditemukan"
-          assert (sdk / "build-tools/37.0.0/aidl").is_file(), "AIDL tidak ditemukan"
-          assert (sdk / "platforms/android-36").is_dir(), "Android API 36 tidak ditemukan"
-          print("Buildozer configuration and Android SDK preflight: OK")
-          PY
-
-      - name: Build APK
-        working-directory: mobile
-        env:
-          BUILDOZER_WARN_ON_ROOT: "0"
-          ANDROID_ACCEPT_SDK_LICENSE: "1"
-        run: buildozer -v android debug
-
-      - name: Verify APK output
+      - name: Verifikasi hasil APK
+        if: success()
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
           APK_FILES=(mobile/bin/*.apk)
           if [ "${#APK_FILES[@]}" -eq 0 ]; then
-            echo "ERROR: Buildozer tidak menghasilkan APK di mobile/bin/"
+            echo 'ERROR: Buildozer tidak menghasilkan file APK di mobile/bin/'
             exit 1
           fi
+          echo 'APK yang berhasil dibuat:'
           ls -lh "${APK_FILES[@]}"
+          mkdir -p dist
+          for apk in "${APK_FILES[@]}"; do
+            cp "$apk" "dist/ST-Stock-Opname-${GITHUB_RUN_NUMBER}.apk"
+          done
 
-      - name: Upload APK artifact
+      - name: Simpan cache termasuk bila build gagal
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.buildozer
+            mobile/.buildozer
+          key: st-stock-p4a-2024.01.21-${{ runner.os }}-${{ hashFiles('mobile/buildozer.spec') }}-${{ github.run_id }}
+
+      - name: Ringkasan petunjuk bila build gagal
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo '## ST Stock Opname — Build gagal'
+            echo
+            echo '### Baris error penting'
+            echo '```text'
+            if [ -f build.log ]; then
+              grep -n -i -E 'error:|fatal error|Traceback|Command failed|No space left|No matching distribution|failed with exit code' build.log \
+                | tail -n 50 | cut -c1-240 || true
+              echo
+              echo '### 80 baris terakhir log build'
+              tail -n 80 build.log | cut -c1-240
+            else
+              echo 'build.log belum dibuat; periksa langkah sebelum Buildozer.'
+            fi
+            echo '```'
+            echo
+            echo '### Ruang disk runner'
+            echo '```text'
+            df -h / | tail -n 2
+            echo '```'
+            echo 'Log lengkap tersedia pada artifact ST-Stock-Opname-Build-Log.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Unggah log lengkap untuk diagnosis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ST-Stock-Opname-Build-Log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Unggah APK sebagai artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: ST-Stock-Opname-Android-APK
-          path: mobile/bin/*.apk
+          path: dist/*.apk
           if-no-files-found: error
           retention-days: 14
